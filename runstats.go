@@ -57,15 +57,19 @@ type Config struct {
 	// Default is 10 seconds
 	CollectionInterval time.Duration
 
-	// Disable collecting CPU Statistics. cpu.*
+	// DisableCPU collecting CPU Statistics. cpu.*
 	// Default is false
-	DisableCpu bool
+	DisableCPU bool
 
 	// Disable collecting Memory Statistics. mem.*
 	DisableMem bool
 
 	// Disable collecting GC Statistics (requires Memory be not be disabled). mem.gc.*
 	DisableGc bool
+
+	//CreateDatabase specifies whether to attempt database creation
+	//errors returned if database already exists
+	CreateDatabase bool
 
 	// Default is DefaultLogger which exits when the library encounters a fatal error.
 	Logger Logger
@@ -109,7 +113,7 @@ func (config *Config) init() (*Config, error) {
 	return config, nil
 }
 
-func RunCollector(config *Config) (err error) {
+func RunCollector(config *Config, stop chan struct{}) (err error) {
 	if config, err = config.init(); err != nil {
 		return err
 	}
@@ -130,11 +134,13 @@ func RunCollector(config *Config) (err error) {
 		return errors.Wrap(err, "failed to ping influxdb client")
 	}
 
-	// Auto create database
-	_, err = queryDB(clnt, fmt.Sprintf("CREATE DATABASE \"%s\"", config.Database))
-
-	if err != nil {
-		config.Logger.Fatalln(err)
+	if config.CreateDatabase {
+		// Auto create database
+		_, err = queryDB(clnt, fmt.Sprintf("CREATE DATABASE \"%s\"", config.Database))
+		if err != nil {
+			config.Logger.Fatalln(err)
+			return err
+		}
 	}
 
 	_runStats := &runStats{
@@ -152,13 +158,26 @@ func RunCollector(config *Config) (err error) {
 
 	_runStats.points = bp
 
-	go _runStats.loop(config.BatchInterval)
+	loopStop := make(chan struct{}, 1)
+	collectorStop := make(chan struct{}, 1)
+
+	//Receive stop signal from stop channel and propagate to loop and collector
+	go func(stopAll <-chan struct{}, loopStop, collectorStop chan<- struct{}) {
+		select {
+		case <-stop:
+			loopStop <- struct{}{}
+			collectorStop <- struct{}{}
+		}
+	}(stop, loopStop, collectorStop)
+
+	go _runStats.loop(config.BatchInterval, loopStop)
 
 	_collector := collector.New(_runStats.onNewPoint)
 	_collector.PauseDur = config.CollectionInterval
-	_collector.EnableCPU = !config.DisableCpu
+	_collector.EnableCPU = !config.DisableCPU
 	_collector.EnableMem = !config.DisableMem
 	_collector.EnableGC = !config.DisableGc
+	_collector.Done = collectorStop
 
 	go _collector.Run()
 
@@ -198,7 +217,7 @@ func (r *runStats) newBatch() (bp client.BatchPoints, err error) {
 }
 
 // Write collected points to influxdb periodically
-func (r *runStats) loop(interval time.Duration) {
+func (r *runStats) loop(interval time.Duration, stop <-chan struct{}) {
 	ticks := time.Tick(interval)
 
 	for {
@@ -209,7 +228,7 @@ func (r *runStats) loop(interval time.Duration) {
 			}
 
 			if err := r.client.Write(r.points); err != nil {
-				r.logger.Fatalln(errors.Wrap(err, "could not write points to InfluxDB"))
+				r.logger.Errorln(errors.Wrap(err, "could not write points to InfluxDB"))
 				continue
 			}
 
@@ -218,7 +237,7 @@ func (r *runStats) loop(interval time.Duration) {
 			bp, err := r.newBatch()
 
 			if err != nil {
-				r.logger.Fatalln(errors.Wrap(err, "could not create BatchPoints"))
+				r.logger.Errorln(errors.Wrap(err, "could not create BatchPoints"))
 				continue
 			}
 
@@ -230,6 +249,9 @@ func (r *runStats) loop(interval time.Duration) {
 
 				r.points.AddPoint(pt)
 			}
+		case <-stop:
+			return
+
 		}
 	}
 }
@@ -237,12 +259,24 @@ func (r *runStats) loop(interval time.Duration) {
 type Logger interface {
 	Println(v ...interface{})
 	Fatalln(v ...interface{})
+	Errorln(v ...interface{})
 }
 
-type DefaultLogger struct{}
+type DefaultLogger struct {
+	//Panic when true defaults default strange behaiour on panicking on small errors
+	//default returns errors silently
+	Panic bool
+}
 
 func (*DefaultLogger) Println(v ...interface{}) {}
-func (*DefaultLogger) Fatalln(v ...interface{}) { log.Fatalln(v) }
+func (d *DefaultLogger) Fatalln(v ...interface{}) {
+	if d.Panic {
+		log.Fatalln(v)
+	}
+}
+func (d *DefaultLogger) Errorln(v ...interface{}) {
+	log.Println(v)
+}
 
 func queryDB(clnt client.Client, cmd string) (res []client.Result, err error) {
 	q := client.Query{
